@@ -13,9 +13,10 @@ type ConfigDrive struct {
 	UserData    UserDataBuilder        `json:"user_data"`
 	MetaData    map[string]interface{} `json:"meta_data"`
 	NetworkData map[string]interface{} `json:"network_data"`
+	Version     string                 `json:"-"`
 }
 
-// UserData may be a string, or JSON data
+// Interface to let us specify a raw string, or a map for the user data
 type UserDataBuilder interface {
 	ToUserData() ([]byte, error)
 }
@@ -23,7 +24,7 @@ type UserDataBuilder interface {
 type UserDataMap map[string]interface{}
 type UserDataString string
 
-// Converts a user data map to JSON-string
+// Converts a UserDataMap to JSON-string
 func (data UserDataMap) ToUserData() ([]byte, error) {
 	return json.MarshalIndent(data, "", "    ")
 }
@@ -36,16 +37,25 @@ type ConfigDriveBuilder interface {
 	ToConfigDrive() (string, error)
 }
 
+// Writes out the ConfigDrive struct to a directory structure, and then
+// packs it as a base64-encoded gzipped ISO9660 image.
 func (configDrive ConfigDrive) ToConfigDrive() (string, error) {
 	// Create a temporary directory for our config drive
 	directory, err := ioutil.TempDir("", "gophercloud")
 	if err != nil {
 		return "", err
 	}
-	//defer os.RemoveAll(directory)
+	defer os.RemoveAll(directory)
 
-	// Build up the paths for OpenStack TODO: this should include version information
-	path := filepath.FromSlash(directory + "/openstack/latest")
+	// Build up the paths for OpenStack
+	var version string
+	if configDrive.Version == "" {
+		version = "latest"
+	} else {
+		version = configDrive.Version
+	}
+
+	path := filepath.FromSlash(directory + "/openstack/" + version)
 	if err := os.MkdirAll(path, 0755); err != nil {
 		return "", err
 	}
@@ -59,7 +69,7 @@ func (configDrive ConfigDrive) ToConfigDrive() (string, error) {
 		}
 
 		if err := ioutil.WriteFile(userDataPath, data, 0644); err != nil {
-	 		return "", err
+			return "", err
 		}
 	}
 
@@ -72,7 +82,7 @@ func (configDrive ConfigDrive) ToConfigDrive() (string, error) {
 		}
 
 		if err := ioutil.WriteFile(metaDataPath, data, 0644); err != nil {
-	 		return "", err
+			return "", err
 		}
 	}
 
@@ -85,7 +95,7 @@ func (configDrive ConfigDrive) ToConfigDrive() (string, error) {
 		}
 
 		if err := ioutil.WriteFile(networkDataPath, data, 0644); err != nil {
-	 		return "", err
+			return "", err
 		}
 	}
 

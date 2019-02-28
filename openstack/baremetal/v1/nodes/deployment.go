@@ -9,50 +9,57 @@ import (
 )
 
 // DeploymentState tracks the current state of an Ironic node deployment.
-type DeploymentState struct {
-	Name       string
-	Percentage int
-}
+type DeploymentState string
 
-var (
-	StateBegin       = DeploymentState{"BEGIN", 0}
-	StateConfigure   = DeploymentState{"CONFIGURE", 5}
-	StateManage      = DeploymentState{"MANAGE", 15}
-	StateWaitManage  = DeploymentState{"WAIT_MANAGE", 20}
-	StateProvide     = DeploymentState{"PROVIDE", 30}
-	StateWaitProvide = DeploymentState{"WAIT_PROVIDE", 35}
-	StateDeploy      = DeploymentState{"DEPLOY", 40}
-	StateWaitDeploy  = DeploymentState{"WAIT_DEPLOY", 50}
-	StateDone        = DeploymentState{"DONE", 100}
-	StateError       = DeploymentState{"ERROR", 100}
+const (
+	StateBegin              DeploymentState = "BEGIN"
+	StateBeginPercent       int             = 0
+	StateConfigure          DeploymentState = "CONFIGURE"
+	StateConfigurePercent   int             = 10
+	StateManage             DeploymentState = "MANAGE"
+	StateManagePercent      int             = 15
+	StateWaitManage         DeploymentState = "WAIT_MANAGE"
+	StateWaitManagePercent  int             = 20
+	StateProvide            DeploymentState = "PROVIDE"
+	StateProvidePercent     int             = 25
+	StateWaitProvide        DeploymentState = "WAIT_PROVIDE"
+	StateWaitProvidePercent int             = 30
+	StateDeploy             DeploymentState = "DEPLOY"
+	StateDeployPercent      int             = 35
+	StateWaitDeploy         DeploymentState = "WAIT_DEPLOY"
+	StateWaitDeployPercent  int             = 95
+	StateDone               DeploymentState = "DONE"
+	StateDonePercent        int             = 100
 )
 
 type Deployment struct {
-	NodeUUID     string
-	UpdateOpts 	 nodes.UpdateOpts
-	ConfigDrive	 ConfigDriveBuilder
-	Error        error
-	Timeout      int64
-	Delay        int64
+	NodeUUID    string
+	UpdateOpts  nodes.UpdateOpts
+	ConfigDrive ConfigDriveBuilder
+	Error       error
+	Timeout     int64
+	Delay       int64
 
-	// Internal
-	client       *gophercloud.ServiceClient
-	currentState DeploymentState
-	status       chan DeploymentState
+	client         *gophercloud.ServiceClient
+	currentState   DeploymentState
+	currentPercent int
+	status         chan<- int
 }
 
 // Prepares and deploys an Ironic baremetal node by driving the Ironic state machine through the needed steps, as per
 // the configuration specified in the *Deployment struct. May be run as a goroutine, pass in a channel to receive
-// updates on the deployment's progress.
-func Deploy(client *gophercloud.ServiceClient, deployment *Deployment, status chan DeploymentState) error {
+// updates on the deployment's percentage.
+func Deploy(client *gophercloud.ServiceClient, deployment *Deployment, percent chan<- int) error {
 	deployment.currentState = StateBegin
 	deployment.client = client
 
-	if status != nil {
-		deployment.status = status
-		deployment.status <- StateBegin
-		defer close(deployment.status)
+	if percent != nil {
+		deployment.status = percent
+		deployment.status <- StateBeginPercent
+	} else {
+		deployment.status = make(chan<- int)
 	}
+	defer close(deployment.status)
 
 	return deployment.nextState()
 }
@@ -97,7 +104,7 @@ func (deployment *Deployment) waitManage() error {
 		} else if node.ProvisionState == nodes.Verifying {
 			time.Sleep(5 * time.Second)
 		} else {
-			deployment.Error = fmt.Errorf("manage failed: node's current state is: %+v", node.ProvisionState)
+			deployment.Error = fmt.Errorf("manage failed: %+v current state is: %+v", node.Name, node.ProvisionState)
 		}
 	}
 
@@ -114,19 +121,22 @@ func (deployment *Deployment) provide() error {
 }
 
 func (deployment *Deployment) waitProvide() error {
-	var err error
+	for {
+		node, err := nodes.Get(deployment.client, deployment.NodeUUID).Extract()
+		if err != nil {
+			deployment.Error = err
+			break
+		}
 
-	for node, err := nodes.Get(deployment.client, deployment.NodeUUID).Extract(); err == nil; {
 		if node.ProvisionState == nodes.Available {
 			break
 		} else if node.ProvisionState == nodes.Cleaning {
 			time.Sleep(5 * time.Second)
 		} else {
-			return fmt.Errorf("provide failed, node's current state is: %+v", node.ProvisionState)
+			return fmt.Errorf("provide failed, %+v current state is: %+v", node.Name, node.ProvisionState)
 		}
 	}
 
-	deployment.Error = err
 	return deployment.nextState()
 }
 
@@ -138,7 +148,7 @@ func (deployment *Deployment) deploy() error {
 	}
 
 	err = nodes.ChangeProvisionState(deployment.client, deployment.NodeUUID, nodes.ProvisionStateOpts{
-		Target: "active",
+		Target:      "active",
 		ConfigDrive: string(configDrive),
 	}).ExtractErr()
 
@@ -147,28 +157,23 @@ func (deployment *Deployment) deploy() error {
 }
 
 func (deployment *Deployment) waitDeploy() error {
-	var percentage = 50
-
 	for {
 		node, err := nodes.Get(deployment.client, deployment.NodeUUID).Extract()
 		if err != nil {
 			deployment.Error = err
+			break
 		}
 
 		if node.ProvisionState == nodes.Active {
 			break
 		} else if node.ProvisionState == nodes.DeployWait || node.ProvisionState == nodes.Deploying {
-			if percentage < 99 {
-				percentage++
-			}
-
-			deployment.status <- DeploymentState{
-				Name: "WAIT_DEPLOY",
-				Percentage: percentage,
+			if deployment.currentPercent < StateWaitDeployPercent {
+				deployment.currentPercent = deployment.currentPercent + 2
+				deployment.status <- deployment.currentPercent
 			}
 			time.Sleep(5 * time.Second)
 		} else {
-			deployment.Error = fmt.Errorf("deploy failed: node's current state is: %+v", node.ProvisionState)
+			deployment.Error = fmt.Errorf("deploy failed: %+v current state is: %+v", node.Name, node.ProvisionState)
 			break
 		}
 	}
@@ -178,6 +183,7 @@ func (deployment *Deployment) waitDeploy() error {
 
 // Great success, or utter failure, either way we're done and we should finally return.
 func (deployment *Deployment) done() error {
+	deployment.status <- StateDonePercent
 	return deployment.Error
 }
 
@@ -186,9 +192,6 @@ func (deployment *Deployment) nextState() error {
 	var nextState func() error
 
 	if deployment.Error != nil {
-		if deployment.status != nil {
-			deployment.status <- StateError
-		}
 		return deployment.done()
 	}
 
@@ -200,30 +203,35 @@ func (deployment *Deployment) nextState() error {
 		nextState = deployment.manage
 		deployment.currentState = StateManage
 	case StateManage:
+		deployment.currentPercent = StateConfigurePercent
 		nextState = deployment.waitManage
 		deployment.currentState = StateWaitManage
 	case StateWaitManage:
+		deployment.currentPercent = StateManagePercent
 		nextState = deployment.provide
 		deployment.currentState = StateProvide
 	case StateProvide:
+		deployment.currentPercent = StateWaitManagePercent
 		nextState = deployment.waitProvide
 		deployment.currentState = StateWaitProvide
 	case StateWaitProvide:
+		deployment.currentPercent = StateProvidePercent
 		nextState = deployment.deploy
 		deployment.currentState = StateDeploy
 	case StateDeploy:
+		deployment.currentPercent = StateWaitProvidePercent
 		deployment.currentState = StateWaitDeploy
 		nextState = deployment.waitDeploy
 	case StateWaitDeploy:
+		deployment.currentPercent = StateDeployPercent
 		deployment.currentState = StateDone
 		nextState = deployment.done
 	default:
 		return fmt.Errorf("unknown state")
 	}
 
-	if deployment.status != nil {
-		deployment.status <- deployment.currentState
-	}
+	// Update percentage
+	deployment.status <- deployment.currentPercent
 
 	// Go to next state
 	return nextState()
