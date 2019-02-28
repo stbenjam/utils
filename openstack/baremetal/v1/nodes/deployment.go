@@ -2,76 +2,77 @@ package nodes
 
 import (
 	"fmt"
+	"time"
+
 	"github.com/gophercloud/gophercloud"
 	"github.com/gophercloud/gophercloud/openstack/baremetal/v1/nodes"
-	"time"
 )
 
-type DeploymentState string
+// DeploymentState tracks the current state of an Ironic node deployment.
+type DeploymentState struct {
+	Name       string
+	Percentage int
+}
 
-const (
-	StateBegin = "BEGIN"
-	StateConfigure = "CONFIGURE"
-	StateManage = "MANAGE"
-	StateWaitManage = "WAIT_MANAGE"
-	StateProvide = "PROVIDE"
-	StateWaitProvide = "WAIT_PROVIDE"
-	StateDeploy = "DEPLOY"
-	StateWaitDeploy = "WAIT_DEPLOY"
-	StateDone = "DONE"
+var (
+	StateBegin       = DeploymentState{"BEGIN", 0}
+	StateConfigure   = DeploymentState{"CONFIGURE", 5}
+	StateManage      = DeploymentState{"MANAGE", 15}
+	StateWaitManage  = DeploymentState{"WAIT_MANAGE", 20}
+	StateProvide     = DeploymentState{"PROVIDE", 30}
+	StateWaitProvide = DeploymentState{"WAIT_PROVIDE", 35}
+	StateDeploy      = DeploymentState{"DEPLOY", 40}
+	StateWaitDeploy  = DeploymentState{"WAIT_DEPLOY", 50}
+	StateDone        = DeploymentState{"DONE", 100}
+	StateError       = DeploymentState{"ERROR", 100}
 )
 
 type Deployment struct {
 	NodeUUID     string
-	InstanceInfo map[string]string
-	Properties   map[string]string
+	UpdateOpts 	 nodes.UpdateOpts
+	ConfigDrive	 ConfigDriveBuilder
 	Error        error
+	Timeout      int64
+	Delay        int64
 
 	// Internal
+	client       *gophercloud.ServiceClient
 	currentState DeploymentState
-	status       chan string
+	status       chan DeploymentState
 }
 
 // Prepares and deploys an Ironic baremetal node by driving the Ironic state machine through the needed steps, as per
-// the configuration specified in the *Deployment struct. May be  run as a goroutine, pass in a channel to receive
+// the configuration specified in the *Deployment struct. May be run as a goroutine, pass in a channel to receive
 // updates on the deployment's progress.
-func Deploy(client *gophercloud.ServiceClient, deployment *Deployment, status chan string) error {
+func Deploy(client *gophercloud.ServiceClient, deployment *Deployment, status chan DeploymentState) error {
 	deployment.currentState = StateBegin
+	deployment.client = client
 
 	if status != nil {
-		status <- StateBegin
 		deployment.status = status
+		deployment.status <- StateBegin
 		defer close(deployment.status)
 	}
 
-	return nextState(client, deployment)
+	return deployment.nextState()
 }
 
-// Configures a node per the settings specified in the *Deployment struct.
-func configure(client *gophercloud.ServiceClient, deployment *Deployment) error {
-	_, err := nodes.Update(client, deployment.NodeUUID, nodes.UpdateOpts{
-		nodes.UpdateOperation{
-			Op:    nodes.AddOp,
-			Path:  "/instance_info",
-			Value: deployment.InstanceInfo,
-		},
-		nodes.UpdateOperation{
-			Op:    nodes.AddOp,
-			Path:  "/properties",
-			Value: deployment.Properties,
-		},
-	}).Extract()
+// Configures a node per the settings specified in the Deployment struct.
+func (deployment *Deployment) configure() error {
+	if len(deployment.UpdateOpts) != 0 {
+		_, err := nodes.Update(deployment.client, deployment.NodeUUID, deployment.UpdateOpts).Extract()
 
-	if err != nil {
-		deployment.Error = err
+		if err != nil {
+			deployment.Error = err
+		}
 	}
 
-	return nextState(client, deployment)
+	return deployment.nextState()
 }
 
 // Sets a node to Manage
-func manage(client *gophercloud.ServiceClient, deployment *Deployment) error {
-	err := nodes.ChangeProvisionState(client, deployment.NodeUUID, nodes.ProvisionStateOpts{
+func (deployment *Deployment) manage() error {
+	err := nodes.ChangeProvisionState(deployment.client, deployment.NodeUUID, nodes.ProvisionStateOpts{
 		Target: "manage",
 	}).ExtractErr()
 
@@ -79,140 +80,151 @@ func manage(client *gophercloud.ServiceClient, deployment *Deployment) error {
 		deployment.Error = err
 	}
 
-	return nextState(client, deployment)
+	return deployment.nextState()
 }
 
 // Waits for a node to be manageable, or for an error to occur
-func waitManage(client *gophercloud.ServiceClient, deployment *Deployment) error {
-	var err error
+func (deployment *Deployment) waitManage() error {
+	for {
+		node, err := nodes.Get(deployment.client, deployment.NodeUUID).Extract()
+		if err != nil {
+			deployment.Error = err
+			break
+		}
 
-	for node, err := nodes.Get(client, deployment.NodeUUID).Extract(); err == nil; {
 		if node.ProvisionState == nodes.Manageable {
 			break
 		} else if node.ProvisionState == nodes.Verifying {
-			time.Sleep(500000)
+			time.Sleep(5 * time.Second)
 		} else {
-			deployment.Error = fmt.Errorf("Manage failed, node's current state is: %+v", node.ProvisionState)
+			deployment.Error = fmt.Errorf("manage failed: node's current state is: %+v", node.ProvisionState)
 		}
 	}
 
-	if err != nil {
-		deployment.Error = err
-	}
-
-	return nextState(client, deployment)
+	return deployment.nextState()
 }
 
-func provide(client *gophercloud.ServiceClient, deployment *Deployment) error {
-	err := nodes.ChangeProvisionState(client, deployment.NodeUUID, nodes.ProvisionStateOpts{
+func (deployment *Deployment) provide() error {
+	err := nodes.ChangeProvisionState(deployment.client, deployment.NodeUUID, nodes.ProvisionStateOpts{
 		Target: "provide",
 	}).ExtractErr()
 
-	if err != nil {
-		return fmt.Errorf("Could not change node to 'provide'.")
-	}
-
-	return nextState(client, deployment)
+	deployment.Error = err
+	return deployment.nextState()
 }
 
-func waitProvide(client *gophercloud.ServiceClient, deployment *Deployment) error {
+func (deployment *Deployment) waitProvide() error {
+	var err error
 
-	for node, err := nodes.Get(client, deployment.NodeUUID).Extract(); err == nil; {
+	for node, err := nodes.Get(deployment.client, deployment.NodeUUID).Extract(); err == nil; {
 		if node.ProvisionState == nodes.Available {
 			break
 		} else if node.ProvisionState == nodes.Cleaning {
-			time.Sleep(500000)
+			time.Sleep(5 * time.Second)
 		} else {
-			return fmt.Errorf("Provide failed, node's current state is: %+v", node.ProvisionState)
+			return fmt.Errorf("provide failed, node's current state is: %+v", node.ProvisionState)
 		}
 	}
 
-	return nextState(client, deployment)
+	deployment.Error = err
+	return deployment.nextState()
 }
 
-func deploy(client *gophercloud.ServiceClient, deployment *Deployment) error {
-
-	err := nodes.ChangeProvisionState(client, deployment.NodeUUID, nodes.ProvisionStateOpts{
-		Target: "active",
-	}).ExtractErr()
-
-	if err != nil {
-		return fmt.Errorf("Could not change node to 'active'.")
-	}
-
-	return nextState(client, deployment)
-}
-
-func waitDeploy(client *gophercloud.ServiceClient, deployment *Deployment) error {
-	var err error
-
-	for node, err := nodes.Get(client, deployment.NodeUUID).Extract(); err == nil; {
-		if node.ProvisionState == nodes.Active {
-			break
-		} else if node.ProvisionState == nodes.DeployWait {
-			time.Sleep(500000)
-		} else {
-			deployment.Error = fmt.Errorf("Deploy failed, node's current state is: %+v", node.ProvisionState)
-		}
-	}
-
+func (deployment *Deployment) deploy() error {
+	configDrive, err := deployment.ConfigDrive.ToConfigDrive()
 	if err != nil {
 		deployment.Error = err
+		return deployment.nextState()
 	}
 
-	return nextState(client, deployment)
+	err = nodes.ChangeProvisionState(deployment.client, deployment.NodeUUID, nodes.ProvisionStateOpts{
+		Target: "active",
+		ConfigDrive: string(configDrive),
+	}).ExtractErr()
+
+	deployment.Error = err
+	return deployment.nextState()
 }
 
-// Great success
-func done(_ *gophercloud.ServiceClient, deployment *Deployment) error {
+func (deployment *Deployment) waitDeploy() error {
+	var percentage = 50
+
+	for {
+		node, err := nodes.Get(deployment.client, deployment.NodeUUID).Extract()
+		if err != nil {
+			deployment.Error = err
+		}
+
+		if node.ProvisionState == nodes.Active {
+			break
+		} else if node.ProvisionState == nodes.DeployWait || node.ProvisionState == nodes.Deploying {
+			if percentage < 99 {
+				percentage++
+			}
+
+			deployment.status <- DeploymentState{
+				Name: "WAIT_DEPLOY",
+				Percentage: percentage,
+			}
+			time.Sleep(5 * time.Second)
+		} else {
+			deployment.Error = fmt.Errorf("deploy failed: node's current state is: %+v", node.ProvisionState)
+			break
+		}
+	}
+
+	return deployment.nextState()
+}
+
+// Great success, or utter failure, either way we're done and we should finally return.
+func (deployment *Deployment) done() error {
 	return deployment.Error
 }
 
-func nextState(client *gophercloud.ServiceClient, deployment *Deployment) error {
-	var nextState func(*gophercloud.ServiceClient, *Deployment) error
+// Transitions the state machine through the various states to drive Ironic deploying a node
+func (deployment *Deployment) nextState() error {
+	var nextState func() error
 
 	if deployment.Error != nil {
 		if deployment.status != nil {
-			deployment.status <- "ERROR"
+			deployment.status <- StateError
 		}
-		return done(client, deployment)
+		return deployment.done()
 	}
 
 	switch state := deployment.currentState; state {
 	case StateBegin:
-		nextState = configure
+		nextState = deployment.configure
 		deployment.currentState = StateConfigure
 	case StateConfigure:
-		nextState = manage
+		nextState = deployment.manage
 		deployment.currentState = StateManage
 	case StateManage:
-		nextState = waitManage
+		nextState = deployment.waitManage
 		deployment.currentState = StateWaitManage
 	case StateWaitManage:
-		nextState = provide
+		nextState = deployment.provide
 		deployment.currentState = StateProvide
 	case StateProvide:
-		nextState = waitProvide
+		nextState = deployment.waitProvide
 		deployment.currentState = StateWaitProvide
 	case StateWaitProvide:
-		nextState = deploy
+		nextState = deployment.deploy
 		deployment.currentState = StateDeploy
 	case StateDeploy:
 		deployment.currentState = StateWaitDeploy
-		nextState = waitDeploy
+		nextState = deployment.waitDeploy
 	case StateWaitDeploy:
 		deployment.currentState = StateDone
-		nextState = done
+		nextState = deployment.done
 	default:
-		return fmt.Errorf("Unknown state")
+		return fmt.Errorf("unknown state")
+	}
+
+	if deployment.status != nil {
+		deployment.status <- deployment.currentState
 	}
 
 	// Go to next state
-	if deployment.status != nil {
-		deployment.status <- string(deployment.currentState)
-	}
-
-	return nextState(client, deployment)
+	return nextState()
 }
-
-

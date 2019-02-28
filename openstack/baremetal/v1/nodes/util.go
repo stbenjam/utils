@@ -10,7 +10,7 @@ import (
 )
 
 // Gzips a file
-func GzipFile(path string) (*[]byte, error) {
+func GzipFile(path string) ([]byte, error) {
 	var buf bytes.Buffer
 
 	w := gzip.NewWriter(&buf)
@@ -29,11 +29,11 @@ func GzipFile(path string) (*[]byte, error) {
 	}
 
 	result := buf.Bytes()
-	return &result, nil
+	return result, nil
 }
 
 // Packs a directory into a gzipped ISO image
-func PackDirectoryAsISO(path string) (*[]byte, error) {
+func PackDirectoryAsISO(path string) ([]byte, error) {
 	iso, err := ioutil.TempFile("", "gophercloud-iso")
 	if err != nil {
 		return nil, err
